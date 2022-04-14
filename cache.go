@@ -9,17 +9,24 @@ import (
 )
 
 const (
-	// segmentCount represents the number of segments within a freecache instance.
-	segmentCount = 256
-	// segmentAndOpVal is bitwise AND applied to the hashVal to find the segment id.
-	segmentAndOpVal = 255
-	minBufSize      = 512 * 1024
+	minBufSize = 512 * 1024
+)
+
+var (
+	segmentCountIdx = map[int]struct{}{
+		0: {}, 4: {}, 8: {}, 16: {}, 32: {},
+		64: {}, 128: {}, 256: {}, 512: {}, 1024: {},
+	}
 )
 
 // Cache is a freecache instance.
 type Cache struct {
-	locks    [segmentCount]sync.Mutex
-	segments [segmentCount]segment
+	locks    []sync.Mutex
+	segments []segment
+	// segmentCount represents the number of segments within a freecache instance.
+	segmentCount int
+	// cache.segmentAndOpVal is bitwise AND applied to the hashVal to find the segment id.
+	segmentAndOpVal uint64
 }
 
 func hashFunc(data []byte) uint64 {
@@ -32,11 +39,16 @@ func hashFunc(data []byte) uint64 {
 // `debug.SetGCPercent()`, set it to a much smaller value
 // to limit the memory consumption and GC pause time.
 func NewCache(size int) (cache *Cache) {
-	return NewCacheCustomTimer(size, defaultTimer{})
+	return NewCacheCustomTimer(size, 256, defaultTimer{})
+}
+
+// NewCacheCustomSegment returns a newly initialize cache by size with custom segment count
+func NewCacheCustomSegment(size int, segmentCount int) (cache *Cache) {
+	return NewCacheCustomTimer(size, segmentCount, defaultTimer{})
 }
 
 // NewCacheCustomTimer returns new cache with custom timer.
-func NewCacheCustomTimer(size int, timer Timer) (cache *Cache) {
+func NewCacheCustomTimer(size int, segmentCount int, timer Timer) (cache *Cache) {
 	if size < minBufSize {
 		size = minBufSize
 	}
@@ -44,10 +56,23 @@ func NewCacheCustomTimer(size int, timer Timer) (cache *Cache) {
 		timer = defaultTimer{}
 	}
 	cache = new(Cache)
+	cache.setSegmentCount(segmentCount)
+	cache.locks = make([]sync.Mutex, segmentCount)
+	cache.segments = make([]segment, segmentCount)
+
 	for i := 0; i < segmentCount; i++ {
 		cache.segments[i] = newSegment(size/segmentCount, i, timer)
 	}
 	return
+}
+
+// SetSegmentCount update segmentCount
+func (cache *Cache) setSegmentCount(segCount int) {
+	if _, ok := segmentCountIdx[segCount]; !ok {
+		panic("invalid segment count")
+	}
+	cache.segmentCount = segCount
+	cache.segmentAndOpVal = uint64(cache.segmentCount) - 1
 }
 
 // Set sets a key, value and expiration for a cache entry and stores it in the cache.
@@ -56,7 +81,7 @@ func NewCacheCustomTimer(size int, timer Timer) (cache *Cache) {
 // but it can be evicted when cache is full.
 func (cache *Cache) Set(key, value []byte, expireSeconds int) (err error) {
 	hashVal := hashFunc(key)
-	segID := hashVal & segmentAndOpVal
+	segID := hashVal & cache.segmentAndOpVal
 	cache.locks[segID].Lock()
 	err = cache.segments[segID].set(key, value, hashVal, expireSeconds)
 	cache.locks[segID].Unlock()
@@ -67,7 +92,7 @@ func (cache *Cache) Set(key, value []byte, expireSeconds int) (err error) {
 // but it can be evicted when cache is full.
 func (cache *Cache) Touch(key []byte, expireSeconds int) (err error) {
 	hashVal := hashFunc(key)
-	segID := hashVal & segmentAndOpVal
+	segID := hashVal & cache.segmentAndOpVal
 	cache.locks[segID].Lock()
 	err = cache.segments[segID].touch(key, hashVal, expireSeconds)
 	cache.locks[segID].Unlock()
@@ -77,7 +102,7 @@ func (cache *Cache) Touch(key []byte, expireSeconds int) (err error) {
 // Get returns the value or not found error.
 func (cache *Cache) Get(key []byte) (value []byte, err error) {
 	hashVal := hashFunc(key)
-	segID := hashVal & segmentAndOpVal
+	segID := hashVal & cache.segmentAndOpVal
 	cache.locks[segID].Lock()
 	value, _, err = cache.segments[segID].get(key, nil, hashVal, false)
 	cache.locks[segID].Unlock()
@@ -95,7 +120,7 @@ func (cache *Cache) Get(key []byte) (value []byte, err error) {
 // not be called. Errors returned by the function will be propagated.
 func (cache *Cache) GetFn(key []byte, fn func([]byte) error) (err error) {
 	hashVal := hashFunc(key)
-	segID := hashVal & segmentAndOpVal
+	segID := hashVal & cache.segmentAndOpVal
 	cache.locks[segID].Lock()
 	err = cache.segments[segID].view(key, fn, hashVal, false)
 	cache.locks[segID].Unlock()
@@ -106,7 +131,7 @@ func (cache *Cache) GetFn(key []byte, fn func([]byte) error) (err error) {
 // it sets a new key, value and expiration for a cache entry and stores it in the cache, returns nil in that case
 func (cache *Cache) GetOrSet(key, value []byte, expireSeconds int) (retValue []byte, err error) {
 	hashVal := hashFunc(key)
-	segID := hashVal & segmentAndOpVal
+	segID := hashVal & cache.segmentAndOpVal
 	cache.locks[segID].Lock()
 	defer cache.locks[segID].Unlock()
 
@@ -124,7 +149,7 @@ func (cache *Cache) GetOrSet(key, value []byte, expireSeconds int) (retValue []b
 // with a bool value to indicate whether an existing record was found
 func (cache *Cache) SetAndGet(key, value []byte, expireSeconds int) (retValue []byte, found bool, err error) {
 	hashVal := hashFunc(key)
-	segID := hashVal & segmentAndOpVal
+	segID := hashVal & cache.segmentAndOpVal
 	cache.locks[segID].Lock()
 	defer cache.locks[segID].Unlock()
 
@@ -139,7 +164,7 @@ func (cache *Cache) SetAndGet(key, value []byte, expireSeconds int) (retValue []
 // Peek returns the value or not found error, without updating access time or counters.
 func (cache *Cache) Peek(key []byte) (value []byte, err error) {
 	hashVal := hashFunc(key)
-	segID := hashVal & segmentAndOpVal
+	segID := hashVal & cache.segmentAndOpVal
 	cache.locks[segID].Lock()
 	value, _, err = cache.segments[segID].get(key, nil, hashVal, true)
 	cache.locks[segID].Unlock()
@@ -157,7 +182,7 @@ func (cache *Cache) Peek(key []byte) (value []byte, err error) {
 // not be called. Errors returned by the function will be propagated.
 func (cache *Cache) PeekFn(key []byte, fn func([]byte) error) (err error) {
 	hashVal := hashFunc(key)
-	segID := hashVal & segmentAndOpVal
+	segID := hashVal & cache.segmentAndOpVal
 	cache.locks[segID].Lock()
 	err = cache.segments[segID].view(key, fn, hashVal, true)
 	cache.locks[segID].Unlock()
@@ -168,7 +193,7 @@ func (cache *Cache) PeekFn(key []byte, fn func([]byte) error) (err error) {
 // This method doesn't allocate memory when the capacity of buf is greater or equal to value.
 func (cache *Cache) GetWithBuf(key, buf []byte) (value []byte, err error) {
 	hashVal := hashFunc(key)
-	segID := hashVal & segmentAndOpVal
+	segID := hashVal & cache.segmentAndOpVal
 	cache.locks[segID].Lock()
 	value, _, err = cache.segments[segID].get(key, buf, hashVal, false)
 	cache.locks[segID].Unlock()
@@ -178,7 +203,7 @@ func (cache *Cache) GetWithBuf(key, buf []byte) (value []byte, err error) {
 // GetWithExpiration returns the value with expiration or not found error.
 func (cache *Cache) GetWithExpiration(key []byte) (value []byte, expireAt uint32, err error) {
 	hashVal := hashFunc(key)
-	segID := hashVal & segmentAndOpVal
+	segID := hashVal & cache.segmentAndOpVal
 	cache.locks[segID].Lock()
 	value, expireAt, err = cache.segments[segID].get(key, nil, hashVal, false)
 	cache.locks[segID].Unlock()
@@ -188,7 +213,7 @@ func (cache *Cache) GetWithExpiration(key []byte) (value []byte, expireAt uint32
 // TTL returns the TTL time left for a given key or a not found error.
 func (cache *Cache) TTL(key []byte) (timeLeft uint32, err error) {
 	hashVal := hashFunc(key)
-	segID := hashVal & segmentAndOpVal
+	segID := hashVal & cache.segmentAndOpVal
 	cache.locks[segID].Lock()
 	timeLeft, err = cache.segments[segID].ttl(key, hashVal)
 	cache.locks[segID].Unlock()
@@ -198,7 +223,7 @@ func (cache *Cache) TTL(key []byte) (timeLeft uint32, err error) {
 // Del deletes an item in the cache by key and returns true or false if a delete occurred.
 func (cache *Cache) Del(key []byte) (affected bool) {
 	hashVal := hashFunc(key)
-	segID := hashVal & segmentAndOpVal
+	segID := hashVal & cache.segmentAndOpVal
 	cache.locks[segID].Lock()
 	affected = cache.segments[segID].del(key, hashVal)
 	cache.locks[segID].Unlock()
