@@ -230,6 +230,15 @@ func (cache *Cache) Del(key []byte) (affected bool) {
 	return
 }
 
+// DelNoProtect deletes an item in the cache by key and returns true or false if a delete occurred.
+// WARNING, no mutex protected
+func (cache *Cache) DelNoProtect(key []byte) (affected bool) {
+	hashVal := hashFunc(key)
+	segID := hashVal & cache.segmentAndOpVal
+	affected = cache.segments[segID].del(key, hashVal)
+	return
+}
+
 // SetInt stores in integer value in the cache.
 func (cache *Cache) SetInt(key int64, value []byte, expireSeconds int) (err error) {
 	var bKey [8]byte
