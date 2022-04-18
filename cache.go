@@ -75,6 +75,36 @@ func (cache *Cache) setSegmentCount(segCount int) {
 	cache.segmentAndOpVal = uint64(cache.segmentCount) - 1
 }
 
+type Unlocker interface {
+	Unlock()
+}
+
+type locker struct {
+	l *sync.Mutex
+}
+
+// Lock lock by key
+func (cache *Cache) Lock(key []byte) Unlocker {
+	hashVal := hashFunc(key)
+	segID := hashVal & cache.segmentAndOpVal
+	cache.locks[segID].Lock()
+	return locker{&cache.locks[segID]}
+}
+
+// Unlock Unlock
+func (l locker) Unlock() {
+	l.l.Unlock()
+}
+
+// Lock lock by key
+func (cache *Cache) With(key []byte, fn func()) {
+	hashVal := hashFunc(key)
+	segID := hashVal & cache.segmentAndOpVal
+	cache.locks[segID].Lock()
+	fn()
+	cache.locks[segID].Unlock()
+}
+
 // Set sets a key, value and expiration for a cache entry and stores it in the cache.
 // If the key is larger than 65535 or value is larger than 1/1024 of the cache size,
 // the entry will not be written to the cache. expireSeconds <= 0 means no expire,
@@ -85,6 +115,15 @@ func (cache *Cache) Set(key, value []byte, expireSeconds int) (err error) {
 	cache.locks[segID].Lock()
 	err = cache.segments[segID].set(key, value, hashVal, expireSeconds)
 	cache.locks[segID].Unlock()
+	return
+}
+
+// SetNoProtect same as Set
+// WARNING: no mutex protect
+func (cache *Cache) SetNoProtect(key, value []byte, expireSeconds int) (err error) {
+	hashVal := hashFunc(key)
+	segID := hashVal & cache.segmentAndOpVal
+	err = cache.segments[segID].set(key, value, hashVal, expireSeconds)
 	return
 }
 
@@ -109,6 +148,15 @@ func (cache *Cache) Get(key []byte) (value []byte, err error) {
 	return
 }
 
+// Get returns the value or not found error.
+// WARNING: no mutex protect
+func (cache *Cache) GetNoProtect(key []byte) (value []byte, err error) {
+	hashVal := hashFunc(key)
+	segID := hashVal & cache.segmentAndOpVal
+	value, _, err = cache.segments[segID].get(key, nil, hashVal, false)
+	return
+}
+
 // GetFn is equivalent to Get or GetWithBuf, but it attempts to be zero-copy,
 // calling the provided function with slice view over the current underlying
 // value of the key in memory. The slice is constrained in length and capacity.
@@ -124,6 +172,15 @@ func (cache *Cache) GetFn(key []byte, fn func([]byte) error) (err error) {
 	cache.locks[segID].Lock()
 	err = cache.segments[segID].view(key, fn, hashVal, false)
 	cache.locks[segID].Unlock()
+	return
+}
+
+// GetFnNoProtect same as GetFn
+// WARNING: no mutex protect
+func (cache *Cache) GetFnNoProtect(key []byte, fn func([]byte) error) (err error) {
+	hashVal := hashFunc(key)
+	segID := hashVal & cache.segmentAndOpVal
+	err = cache.segments[segID].view(key, fn, hashVal, false)
 	return
 }
 
@@ -168,6 +225,15 @@ func (cache *Cache) Peek(key []byte) (value []byte, err error) {
 	cache.locks[segID].Lock()
 	value, _, err = cache.segments[segID].get(key, nil, hashVal, true)
 	cache.locks[segID].Unlock()
+	return
+}
+
+// PeekNoProtect returns the value or not found error, without updating access time or counters.
+// WARNING: no mutex protect
+func (cache *Cache) PeekNoProtect(key []byte) (value []byte, err error) {
+	hashVal := hashFunc(key)
+	segID := hashVal & cache.segmentAndOpVal
+	value, _, err = cache.segments[segID].get(key, nil, hashVal, true)
 	return
 }
 
